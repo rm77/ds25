@@ -64,10 +64,10 @@ class Logger:
                 evs=list(self.events)
             if not evs:
                 continue
-            # Physical order
             phys=sorted(evs, key=lambda e:(e['phy_ts'], e['node'], e['lamport']))
             lam =sorted(evs, key=lambda e:(e['lamport'], e['node']))
-            # Vector: simple layering (sets of incomparable events)
+
+            # Vector layers (set of incomparable events)
             used=set(); layers: List[List[Dict]]=[]
             while len(used)<len(evs):
                 layer=[]
@@ -113,21 +113,28 @@ class KV:
             return self.store.get(k,(0.0,'<nil>'))[1]
 
 class Gossip:
-    def __init__(self, node_id:int, udp_port:int, peers_map:List[Tuple[str,int,int]]):
+    """
+    peers_map: List[(host, tcp, udp, id)]
+    Sends gossip to each peer's UDP (critical fix).
+    """
+    def __init__(self, node_id:int, udp_port:int, peers_map:List[Tuple[str,int,int,int]]):
         self.id=node_id; self.udp_port=udp_port
-        self.table: Dict[int, Dict]= {self.id:{'state':STATE_ALIVE,'hb':0,'last':time.monotonic(),'addr':('127.0.0.1',None)}}
-        for h,tcp,nid in peers_map:
+        self.table: Dict[int, Dict]= {
+            self.id:{'state':STATE_ALIVE,'hb':0,'last':time.monotonic(),'addr':('127.0.0.1',None)}
+        }
+        for h,tcp,udp,nid in peers_map:
             self.table[nid]={'state':STATE_SUSPECT,'hb':0,'last':time.monotonic(),'addr':(h,tcp)}
         self.peers_map=peers_map
         self.sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
         self.sock.bind(('0.0.0.0',udp_port))
         threading.Thread(target=self._rx,daemon=True).start()
         threading.Thread(target=self._tx,daemon=True).start()
+
     def _rx(self):
         while True:
             try:
                 data,addr=self.sock.recvfrom(65535)
-                msg=json.loads(data.decode());
+                msg=json.loads(data.decode())
                 if msg.get('type')!='gossip': continue
                 sid=msg['from']; hb=msg.get('heartbeat',0)
                 now=time.monotonic()
@@ -144,11 +151,13 @@ class Gossip:
                     if rec.get('addr'): loc['addr']=tuple(rec['addr'])
             except Exception:
                 pass
+
     def _tx(self):
         while True:
             time.sleep(0.5)
             now=time.monotonic(); me=self.table[self.id]
             me['hb']=me.get('hb',0)+1; me['last']=now; me['state']=STATE_ALIVE
+            # suspicion / death
             for nid,inf in list(self.table.items()):
                 if nid==self.id: continue
                 age=now-inf['last']
@@ -156,17 +165,19 @@ class Gossip:
                 elif age>2.0 and inf['state']==STATE_ALIVE: inf['state']=STATE_SUSPECT
             msg={'type':'gossip','from':self.id,'heartbeat':me['hb'],'known':{str(n):{'state':inf['state'],'hb':inf['hb'],'addr':list(inf.get('addr',('127.0.0.1',None)))} for n,inf in self.table.items()}}
             targets=random.sample(self.peers_map, k=min(2, len(self.peers_map))) if self.peers_map else []
-            for h,_tcp,_nid in targets:
-                try: self.sock.sendto(json.dumps(msg).encode(), (h,self.udp_port))
+            for h,_tcp,peer_udp,_nid in targets:
+                try: self.sock.sendto(json.dumps(msg).encode(), (h, peer_udp))
                 except Exception: pass
+
     def leader(self)->Optional[int]:
         alive=[nid for nid,inf in self.table.items() if inf['state']==STATE_ALIVE]
         return max(alive) if alive else None
+
     def addr_of(self,nid:int)->Optional[Tuple[str,int]]:
-        for h,tcp,i in self.peers_map:
+        for h,tcp,_udp,i in self.peers_map:
             if i==nid: return (h,tcp)
         if nid==self.id:
-            for h,tcp,i in self.peers_map:
+            for h,tcp,_udp,i in self.peers_map:
                 if i==self.id: return (h,tcp)
         return None
 
@@ -188,10 +199,12 @@ class MutexCoordinator:
         return None
 
 class Node:
-    def __init__(self, node_id:int, tcp_port:int, udp_port:int, peers_map:List[Tuple[str,int,int]], logger_addr:Tuple[str,int], numnodes:int, use_mutex:bool):
+    def __init__(self, node_id:int, tcp_port:int, udp_port:int, peers_map:List[Tuple[str,int,int,int]],
+                 logger_addr:Tuple[str,int], numnodes:int, use_mutex:bool):
         self.id=node_id; self.tcp_port=tcp_port; self.use_mutex=use_mutex
-        if not any(i==node_id for _,_,i in peers_map):
-            peers_map=[('127.0.0.1', tcp_port, node_id)] + peers_map
+        # Ensure self is present with its UDP and TCP
+        if not any(i==node_id for *_, i in peers_map):
+            peers_map=[('127.0.0.1', tcp_port, udp_port, node_id)] + peers_map
         self.gossip=Gossip(node_id, udp_port, peers_map)
         self.coord=MutexCoordinator()
         self.kv=KV()
@@ -201,7 +214,6 @@ class Node:
         self.vector=[0]*numnodes
         threading.Thread(target=self.tcp_server,daemon=True).start()
         threading.Thread(target=self.status_loop,daemon=True).start()
-        # NEW: interactive local input loop
         threading.Thread(target=self.interactive_loop, daemon=True).start()
 
     # ------- Clocks & logging -------
@@ -263,28 +275,24 @@ class Node:
 
     # ------- Local helpers (used by server & interactive) -------
     def _do_put(self, key: str, val: str):
-        # Acquire mutex if enabled
         if self.use_mutex:
             self._tick_local(); self._log('MUTEX_REQ', key)
             self._acquire_mutex(); self._log('MUTEX_GOT', key)
-        # Local apply
         self._tick_local(); self._log('APPLY_LOCAL', f"{key}={val}")
         self.kv.put(key,val)
-        # Replicate
         self._tick_local(); self._log('REPL_SEND', f"{key}={val}")
         self._replicate_put(key,val)
-        # Release
         if self.use_mutex:
             self._tick_local(); self._release_mutex(); self._log('MUTEX_REL', key)
 
     # ------- Replication -------
     def _replicate_put(self, k, v):
-        payload_base=f"REPL_PUT {k} {v} {self.lamport} {json.dumps(self.vector)}\n".encode()
-        for h,tcp,i in self.gossip.peers_map:
+        payload=f"REPL_PUT {k} {v} {self.lamport} {json.dumps(self.vector)}\n".encode()
+        for h,tcp,_udp,i in self.gossip.peers_map:
             if i==self.id: continue
             try:
                 s=socket.create_connection((h,tcp), timeout=0.4)
-                s.sendall(payload_base); s.close()
+                s.sendall(payload); s.close()
             except Exception:
                 pass
 
@@ -307,6 +315,7 @@ class Node:
                 if resp.strip()=="GRANTED": return
             except Exception: pass
             time.sleep(0.05)
+
     def _release_mutex(self):
         leader=self.gossip.leader()
         if leader==self.id:
@@ -325,7 +334,7 @@ class Node:
             print(f"[node {self.id}] leader={leader} color={self.kv.get('color')} L={self.lamport} V={self.vector}")
             time.sleep(1.0)
 
-    # ------- NEW: Interactive input on each node -------
+    # ------- Interactive input on each node -------
     def interactive_loop(self):
         print(f"[node {self.id}] Interactive ready. Type: GET <key> | PUT <key> <value> | help")
         while True:
@@ -352,8 +361,27 @@ class Node:
 
 # --------------------------------- Main ----------------------------------
 
+def parse_peers(s: str) -> List[Tuple[str,int,int,int]]:
+    """
+    Accepts either host:tcp=id  or host:tcp:udp=id
+    If udp omitted, infer udp=tcp+100
+    Returns list of (host, tcp, udp, id)
+    """
+    out=[]
+    if not s: return out
+    for tok in s.split(','):
+        hp, nid_s = tok.split('=')
+        parts = hp.split(':')
+        if len(parts)==2:
+            h, tcp_s = parts
+            udp_s = str(int(tcp_s)+100)
+        else:
+            h, tcp_s, udp_s = parts
+        out.append((h, int(tcp_s), int(udp_s), int(nid_s)))
+    return out
+
 def main():
-    ap=argparse.ArgumentParser(description='KV store')
+    ap=argparse.ArgumentParser(description='KV store with optional gossip-mutex and logger (final)')
     ap.add_argument('--logger', action='store_true', help='Run as logger node')
     ap.add_argument('--logger-tcp', type=int, default=9000)
     ap.add_argument('--numnodes', type=int, default=3)
@@ -361,7 +389,7 @@ def main():
     ap.add_argument('--id', type=int)
     ap.add_argument('--tcp', type=int)
     ap.add_argument('--udp', type=int)
-    ap.add_argument('--peers', type=str, default='', help='host:tcp=id,... (others; self auto-added)')
+    ap.add_argument('--peers', type=str, default='', help='host:tcp=id or host:tcp:udp=id (others; self auto-added)')
     ap.add_argument('--logger-addr', type=str, default='127.0.0.1:9000')
     ap.add_argument('--use-mutex', type=int, default=0, help='0/1 to disable/enable mutex')
 
@@ -374,10 +402,7 @@ def main():
     if not all([args.id, args.tcp, args.udp]):
         print('Run as node requires --id --tcp --udp', file=sys.stderr); sys.exit(2)
 
-    peers=[]
-    if args.peers:
-        for t in args.peers.split(','):
-            hp,i=t.split('='); h,tp=hp.split(':'); peers.append((h,int(tp),int(i)))
+    peers=parse_peers(args.peers)
     la_h, la_p = args.logger_addr.split(':'); logger_addr=(la_h,int(la_p))
 
     Node(args.id, args.tcp, args.udp, peers, logger_addr, args.numnodes, bool(args.use_mutex))
